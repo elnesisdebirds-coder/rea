@@ -1,41 +1,52 @@
 import { analysisClientFailureForOperation } from "./AnalysisClientFailure.js";
-import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
-import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
-import { bindArtifactFileCleanup } from "../artifacts/ArtifactFileOperation.js";
-import { AnalysisCleanupLease } from "../artifacts/AnalysisCleanupLease.js";
+import {
+  ArtifactResourceScope,
+  ArtifactReaderFailure,
+  bindArtifactFileCleanup,
+  AnalysisCleanupLease,
+} from "../resources/index.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import type {
   AnalysisClient,
   RetainedResourceScope,
-} from "../application/AnalysisProvider.js";
+} from "../ports/AnalysisProvider.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
-import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
-import { ProviderAdapterError } from "../domain/providerAdapterError.js";
-import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
+import {
+  AnalysisCancelledError,
+  cancelledBy,
+  carriedReason,
+} from "../domain/analysisErrorCore.js";
+import {
+  closedAnalysisClientError,
+  ProviderAdapterError,
+} from "../domain/providerAdapterError.js";
+import { analysisErrorWithCleanupDependencies } from "../domain/analysisErrorCleanup.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { SharedStartupAttempt } from "../process/SharedStartupAttempt.js";
-import { closeAnalysisClient } from "../application/AnalysisClientCleanup.js";
+import { closeAnalysisClient } from "./AnalysisClientCleanup.js";
 
 /** Own deferred client creation while callers wait independently and close joins it. */
 export class AnalysisClientCreation {
   readonly #inspectionResources = new ArtifactResourceScope();
-  readonly #inspectionOwner: RetainedResourceScope = {
-    retain: (owner, resource) =>
-      this.#inspectionResources.retain({
-        kind: "lease",
-        resource,
-        lease: AnalysisCleanupLease.forCloseOwner(owner, resource),
-      }),
-    run: (operation) => this.#inspectionResources.run(operation),
-  };
+  readonly #inspectionOwner = this.#inspectionResources.forCloseOwners();
   #attempt:
     | SharedStartupAttempt<Result<AnalysisClient, AnalysisError>>
     | undefined;
   #client: AnalysisClient | undefined;
   #failure: AnalysisError | undefined;
   #closed = false;
-  #clientLease: AnalysisCleanupLease | undefined;
+  /**
+   * The close owner of one exact client, and the failure its last close
+   * produced. External cleanup can settle that failure without the lease.
+   */
+  #clientLease:
+    | {
+        readonly client: AnalysisClient;
+        readonly lease: AnalysisCleanupLease;
+        failure?: AnalysisError;
+      }
+    | undefined;
   #closing: Promise<Result<null, AnalysisError>> | undefined;
   #closeOptions: Parameters<AnalysisClient["close"]>[0];
 
@@ -62,23 +73,26 @@ export class AnalysisClientCreation {
       !this.#closed &&
       this.#attempt === undefined &&
       this.#failure === undefined &&
-      this.#clientLease?.released !== true
+      !this.#clientReleased()
+    );
+  }
+
+  /** Whether the leased client is gone: its lease or its settled close released it. */
+  #clientReleased(): boolean {
+    const entry = this.#clientLease;
+    return (
+      entry !== undefined &&
+      (entry.lease.released ||
+        (entry.failure !== undefined && !entry.failure.cleanupIncomplete))
     );
   }
   async acquire(
     operation: string,
     signal?: AbortSignal,
   ): Promise<Result<AnalysisClient, AnalysisError>> {
-    if (signal?.aborted)
-      return err(
-        new AnalysisCancelledError(operation, { cause: signal.reason }),
-      );
+    if (signal?.aborted) return err(cancelledBy(operation, signal));
     if (this.#closed)
-      return err(
-        new ProviderAdapterError(this.providerId, operation, {
-          diagnostics: { reason: "client_closed" },
-        }),
-      );
+      return err(closedAnalysisClientError(this.providerId, operation));
     if (this.#failure?.cleanupIncomplete)
       return err(
         analysisClientFailureForOperation(
@@ -88,13 +102,13 @@ export class AnalysisClientCreation {
         ),
       );
     const ready = this.readyClient;
-    if (ready !== undefined && this.#clientLease?.released !== true)
-      return ok(ready);
-    if (this.#clientLease?.released === true) {
+    if (ready !== undefined && !this.#clientReleased()) return ok(ready);
+    if (this.#clientReleased()) {
       this.#client = undefined;
       this.#clientLease = undefined;
     }
     let attempt = this.#attempt;
+    const draining = attempt?.signal.aborted === true;
     if (attempt === undefined) {
       this.#failure = undefined;
       attempt = new SharedStartupAttempt((ownerSignal) =>
@@ -103,15 +117,23 @@ export class AnalysisClientCreation {
       const owned = attempt;
       this.#attempt = owned;
       void owned.promise.then((result) => {
+        if (this.#attempt !== owned) return;
         if (!result.ok) this.#failure = result.error;
-        if (this.#attempt === owned) this.#attempt = undefined;
+        this.#attempt = undefined;
       });
     }
     const waited = await attempt.wait(signal);
     if (waited.status === "cancelled")
-      return err(
-        new AnalysisCancelledError(operation, { cause: signal?.reason }),
-      );
+      return err(cancelledBy(operation, carriedReason(waited.reason)));
+    if (
+      draining &&
+      !signal?.aborted &&
+      !waited.value.ok &&
+      waited.value.error instanceof AnalysisCancelledError &&
+      !waited.value.error.cleanupIncomplete &&
+      waited.value.error.cause === attempt.signal.reason
+    )
+      return this.acquire(operation, signal);
     if (!waited.value.ok)
       return err(
         analysisClientFailureForOperation(
@@ -120,10 +142,7 @@ export class AnalysisClientCreation {
           operation,
         ),
       );
-    if (signal?.aborted)
-      return err(
-        new AnalysisCancelledError(operation, { cause: signal.reason }),
-      );
+    if (signal?.aborted) return err(cancelledBy(operation, signal));
     return waited.value;
   }
 
@@ -131,11 +150,7 @@ export class AnalysisClientCreation {
     signal: AbortSignal,
   ): Promise<Result<AnalysisClient, AnalysisError>> {
     if (signal.aborted)
-      return err(
-        new AnalysisCancelledError("create_analysis_client", {
-          cause: signal.reason,
-        }),
-      );
+      return err(cancelledBy("create_analysis_client", signal));
     let primary: AnalysisError | undefined;
     try {
       this.#client = await this.create(signal, this.#inspectionOwner);
@@ -153,28 +168,26 @@ export class AnalysisClientCreation {
       this.#inspectionResources.retryCleanup(),
     );
     if (signal.aborted && primary === undefined)
-      primary = new AnalysisCancelledError("create_analysis_client", {
-        cause: signal.reason,
-      });
+      primary = cancelledBy("create_analysis_client", signal);
     if (!inspections.ok)
       primary =
         primary === undefined
           ? inspections.error
-          : analysisErrorWithCleanupFailure(
+          : analysisErrorWithCleanupDependencies(
               primary,
               inspections.error,
               "create_analysis_client",
-            ).bindCleanupDependencies([primary, inspections.error]);
+            );
     if (primary !== undefined) {
       const closed = await this.#releaseClient(this.#closeOptions);
       return err(
         closed.ok
           ? primary
-          : analysisErrorWithCleanupFailure(
+          : analysisErrorWithCleanupDependencies(
               primary,
               closed.error,
               "create_analysis_client",
-            ).bindCleanupDependencies([primary, closed.error]),
+            ),
       );
     }
     if (this.#client === undefined)
@@ -219,14 +232,14 @@ export class AnalysisClientCreation {
         const inspectionFailure = inspections.ok
           ? undefined
           : inspections.error;
-        const closed = await this.#releaseClient(options);
+        const closed = await this.#releaseClient(this.#closeOptions);
         if (!closed.ok && inspectionFailure !== undefined)
           return err(
-            analysisErrorWithCleanupFailure(
+            analysisErrorWithCleanupDependencies(
               closed.error,
               inspectionFailure,
               "create_analysis_client",
-            ).bindCleanupDependencies([closed.error, inspectionFailure]),
+            ),
           );
         if (!closed.ok) return closed;
         if (inspectionFailure !== undefined) return err(inspectionFailure);
@@ -243,17 +256,23 @@ export class AnalysisClientCreation {
   ): Promise<Result<null, AnalysisError>> {
     if (this.#client === undefined) return ok(null);
     const client = this.#client;
-    this.#closeOptions = options;
-    this.#clientLease ??= new AnalysisCleanupLease(async () => {
-      const result = await closeAnalysisClient(
-        client,
-        this.providerId,
-        this.#closeOptions,
-      );
-      if (!result.ok) throw result.error;
-    });
+    if (options !== undefined) this.#closeOptions = options;
+    if (this.#clientLease?.client !== client) this.#clientLease = undefined;
+    this.#clientLease ??= {
+      client,
+      lease: new AnalysisCleanupLease(async () => {
+        const result = await closeAnalysisClient(
+          client,
+          this.providerId,
+          this.#closeOptions,
+        );
+        if (!result.ok) throw result.error;
+      }),
+    };
+    const entry = this.#clientLease;
+    const clientLease = entry.lease;
     try {
-      await this.#clientLease.release();
+      await clientLease.release();
       return ok(null);
     } catch (cause: unknown) {
       const failure = new ProviderCleanupError(
@@ -270,8 +289,24 @@ export class AnalysisClientCreation {
         },
         { cause, operation: "create_analysis_client" },
       );
-      failure.bindCleanupResourceOwner(this.#clientLease);
-      this.#clientLease.bindCleanupError(failure);
+      if (cause instanceof AnalysisError && cause.hasCleanupOwner) {
+        failure.bindCleanupResourceOwner({
+          get cleanupResources() {
+            return clientLease.released || !cause.cleanupIncomplete
+              ? []
+              : cause.cleanupResources;
+          },
+        });
+        failure.bindCleanupReleaseClaim({
+          get cleanupReleased() {
+            return !cause.cleanupIncomplete;
+          },
+        });
+      } else {
+        failure.bindCleanupResourceOwner(clientLease);
+      }
+      clientLease.bindCleanupError(failure);
+      entry.failure = failure;
       return err(failure);
     }
   }

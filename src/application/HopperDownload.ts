@@ -1,4 +1,6 @@
+import { OwnerCancellation } from "../domain/analysisErrorCore.js";
 import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
+import { isAbortOf } from "../process/SignalAbort.js";
 import { err, ok, type Result } from "../domain/result.js";
 
 /** Why a URL was refused before any vendor response could be admitted. */
@@ -7,7 +9,8 @@ export type HopperUrlRefusal =
   | "non_https"
   | "credentials"
   | "redirect_without_location"
-  | "redirect_limit";
+  | "redirect_limit"
+  | "redirect_cross_origin";
 
 /**
  * Transport facts for one Hopper request that yielded no admitted bytes.
@@ -21,7 +24,14 @@ export type HopperDownloadFailure = { readonly url: string } & (
       /** Absent when the response did not carry a valid HTTP failure status. */
       readonly httpStatus?: number;
     }
-  | { readonly kind: "timeout"; readonly timeoutMs: number }
+  | {
+      readonly kind: "timeout";
+      /** No bytes arrived within the stall bound, or the overall bound elapsed. */
+      readonly limit: "stalled" | "deadline";
+      readonly timeoutMs: number;
+      /** Response body bytes received before the limit was reached. */
+      readonly receivedBytes: number;
+    }
   | { readonly kind: "network"; readonly detail: string }
   | { readonly kind: "response_too_large"; readonly maxBytes: number }
   | { readonly kind: "url_refused"; readonly refusal: HopperUrlRefusal }
@@ -41,6 +51,18 @@ export type HopperRequestFailure = HopperDownloadFailure & {
 /** Maximum admitted vendor response bytes, shared by Hopper setup adapters. */
 export const HOPPER_DOWNLOAD_BYTES = 100_000_000;
 
+/** Longest wait for the response or its next bytes before a download stalls. */
+const HOPPER_DOWNLOAD_STALL_MS = 30_000;
+
+/**
+ * Overall bound for one download. A slow connection that keeps delivering
+ * bytes is bounded here rather than by a deadline sized for fast networks.
+ */
+const HOPPER_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
+
+/** Small release feed and key requests must not use the package bounds. */
+export const HOPPER_METADATA_TIMEOUT_MS = 10_000;
+
 /**
  * Bound observed response bytes before retaining them, including chunked bodies.
  * Expected transport outcomes are returned; caller cancellation still rejects
@@ -51,11 +73,16 @@ export const downloadHopperPackage = async (
   options: {
     readonly signal?: AbortSignal;
     readonly maxBytes?: number;
+    /** Overall bound; a stall bound applies only when it is shorter. */
     readonly timeoutMs?: number;
   } = {},
 ): Promise<HopperDownload> => {
-  const timeoutMs = options.timeoutMs ?? 120_000;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000)
+  const timeoutMs = options.timeoutMs ?? HOPPER_DOWNLOAD_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > HOPPER_DOWNLOAD_TIMEOUT_MS
+  )
     throw new RangeError("Invalid Hopper response time budget");
   const maxBytes = options.maxBytes ?? HOPPER_DOWNLOAD_BYTES;
   if (
@@ -64,22 +91,59 @@ export const downloadHopperPackage = async (
     maxBytes > HOPPER_DOWNLOAD_BYTES
   )
     throw new RangeError("Invalid Hopper response byte budget");
-  const deadline = AbortSignal.timeout(timeoutMs);
   // Remove transport credentials once, where every failure is created.
   const reported = sanitizeBrowserUrl(url).url;
+  let receivedBytes = 0;
+  let expired:
+    | {
+        readonly limit: "stalled" | "deadline";
+        readonly timeoutMs: number;
+        readonly receivedBytes: number;
+      }
+    | undefined;
+  const deadline = new AbortController();
+  const expire = (limit: "stalled" | "deadline", limitMs: number) => {
+    expired ??= { limit, timeoutMs: limitMs, receivedBytes };
+    deadline.abort(OwnerCancellation.deadlineElapsed);
+  };
+  const overall = setTimeout(() => {
+    expire("deadline", timeoutMs);
+  }, timeoutMs);
+  let stall: NodeJS.Timeout | undefined;
+  const progressed = (bytes: number) => {
+    receivedBytes = bytes;
+    if (HOPPER_DOWNLOAD_STALL_MS >= timeoutMs) return;
+    clearTimeout(stall);
+    stall = setTimeout(() => {
+      expire("stalled", HOPPER_DOWNLOAD_STALL_MS);
+    }, HOPPER_DOWNLOAD_STALL_MS);
+  };
+  const selectedSignal =
+    options.signal === undefined
+      ? deadline.signal
+      : AbortSignal.any([options.signal, deadline.signal]);
+  // Node may replace falsy abort reasons during body reads. Send a unique,
+  // truthy reason through fetch so only its own rejection can be attributed.
+  const transport = new AbortController();
+  const transportReason = {};
+  const cancelTransport = () => transport.abort(transportReason);
+  if (selectedSignal.aborted) cancelTransport();
+  else
+    selectedSignal.addEventListener("abort", cancelTransport, { once: true });
   try {
-    return await readHopperResponse(
-      url,
-      reported,
-      options.signal === undefined
-        ? deadline
-        : AbortSignal.any([options.signal, deadline]),
+    progressed(0);
+    return await readHopperResponse(url, reported, {
+      signal: transport.signal,
       maxBytes,
-    );
-  } catch (cause: unknown) {
-    if (options.signal?.aborted === true) throw cause;
-    if (deadline.aborted)
-      return err({ url: reported, kind: "timeout", timeoutMs });
+      progressed,
+    });
+  } catch (observed: unknown) {
+    const cause = isAbortOf(observed, transport.signal)
+      ? selectedSignal.reason
+      : observed;
+    if (isAbortOf(cause, options.signal)) throw cause;
+    if (expired !== undefined && isAbortOf(cause, deadline.signal))
+      return err({ url: reported, kind: "timeout", ...expired });
     // Fetch reports network errors (DNS, TLS, reset, truncated body) as TypeError.
     if (cause instanceof TypeError)
       return err({
@@ -88,14 +152,26 @@ export const downloadHopperPackage = async (
         detail: networkDetail(cause),
       });
     throw cause;
+  } finally {
+    selectedSignal.removeEventListener("abort", cancelTransport);
+    clearTimeout(overall);
+    clearTimeout(stall);
   }
 };
 
 const readHopperResponse = async (
   requested: string,
   url: string,
-  signal: AbortSignal,
-  maxBytes: number,
+  {
+    signal,
+    maxBytes,
+    progressed,
+  }: {
+    readonly signal: AbortSignal;
+    readonly maxBytes: number;
+    /** Reports received body bytes so the stall bound restarts. */
+    readonly progressed: (receivedBytes: number) => void;
+  },
 ): Promise<HopperDownload> => {
   const fetched = await fetchHopperResponse(requested, signal);
   if (!fetched.ok)
@@ -117,6 +193,7 @@ const readHopperResponse = async (
     return err(tooLarge);
   }
   if (response.body === null) return ok(new Uint8Array());
+  progressed(0);
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let bytes = 0;
@@ -130,6 +207,7 @@ const readHopperResponse = async (
       }
       chunks.push(chunk.value);
       bytes += chunk.value.byteLength;
+      if (chunk.value.byteLength > 0) progressed(bytes);
     }
   } finally {
     reader.releaseLock();
@@ -175,6 +253,7 @@ const fetchHopperResponse = async (
     return err("invalid_url");
   }
   let requested = url;
+  const expectedOrigin = selected.origin;
   for (let redirects = 0; ; redirects++) {
     if (selected.protocol !== "https:") return err("non_https");
     // Fetch cannot request userinfo and would echo it in its TypeError message.
@@ -196,6 +275,14 @@ const fetchHopperResponse = async (
     } catch {
       return err("invalid_url");
     }
+    // Check the destination's own refusals before its origin, so an HTTPS
+    // downgrade still reports non_https and a credentialed destination
+    // still reports credentials, as the next loop pass would.
+    if (next.protocol !== "https:") return err("non_https");
+    if (next.username !== "" || next.password !== "") return err("credentials");
+    // Redirects may leave the validated origin; only the initial URL was
+    // checked by callers, so refuse a hop another origin would produce.
+    if (next.origin !== expectedOrigin) return err("redirect_cross_origin");
     // Fetch inherits the previous fragment when Location has none.
     if (!location.includes("#")) next.hash = selected.hash;
     selected = next;
@@ -215,6 +302,7 @@ const refusals: Readonly<Record<HopperUrlRefusal, string>> = {
   credentials: "a request or redirect URL contained credentials",
   redirect_without_location: "a redirect response omitted its Location",
   redirect_limit: `the response redirected more than ${FETCH_REDIRECT_LIMIT} times`,
+  redirect_cross_origin: "a redirect response left the requested origin",
 };
 
 /** One sentence naming the failed request, its URL and the observed outcome. */
@@ -228,7 +316,9 @@ export const describeHopperRequestFailure = (
         ? `${subject} received an unsuccessful HTTP response without a valid status.`
         : `${subject} returned HTTP ${failure.httpStatus}.`;
     case "timeout":
-      return `${subject} did not complete within ${failure.timeoutMs / 1000} seconds.`;
+      return failure.limit === "stalled"
+        ? `${subject} stalled: no bytes arrived for ${failure.timeoutMs / 1000} seconds after ${failure.receivedBytes} bytes were received.`
+        : `${subject} did not complete within ${failure.timeoutMs / 1000} seconds; ${failure.receivedBytes} bytes were received.`;
     case "network":
       return `${subject} failed with a network error (${failure.detail}).`;
     case "response_too_large":
